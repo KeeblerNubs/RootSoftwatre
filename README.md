@@ -47,6 +47,9 @@ Non-interactive:
 
 ```powershell
 .\src\A67L-Gen2-Toolkit.ps1 -Diagnostics
+
+# Select one device when multiple phones are connected:
+.\src\A67L-Gen2-Toolkit.ps1 -Diagnostics -Serial "YOUR_DEVICE_SERIAL"
 ```
 
 Output goes to `reports\<timestamp>\` (`report.json`, `report.txt`, `logcat.txt`,

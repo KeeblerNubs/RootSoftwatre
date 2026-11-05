@@ -38,13 +38,16 @@ function Get-Tool {
 }
 
 function Invoke-Adb {
-    param($Adb, [string[]]$Arguments)
-    $out = & $Adb @Arguments 2>&1
+    param($Adb, [string[]]$Arguments, [string]$Serial)
+    $adbArguments = @()
+    if ($Serial) { $adbArguments += @('-s', $Serial) }
+    $adbArguments += $Arguments
+    $out = & $Adb @adbArguments 2>&1
     return ($out | Out-String).Trim()
 }
 
 function Get-DeviceProps {
-    param($Adb)
+    param($Adb, [string]$Serial)
     $keys = @(
         'ro.build.fingerprint','ro.product.brand','ro.product.model','ro.product.device',
         'ro.board.platform','ro.hardware','ro.boot.hardware','ro.boot.slot_suffix',
@@ -54,7 +57,7 @@ function Get-DeviceProps {
     )
     $props = [ordered]@{}
     foreach ($k in $keys) {
-        $v = Invoke-Adb $Adb @('shell','getprop',$k)
+        $v = Invoke-Adb -Adb $Adb -Arguments @('shell','getprop',$k) -Serial $Serial
         if ([string]::IsNullOrWhiteSpace($v)) { $v = '<not reported>' }
         $props[$k] = $v
     }
@@ -62,11 +65,11 @@ function Get-DeviceProps {
 }
 
 function Get-PartitionProbe {
-    param($Adb)
-    $raw = Invoke-Adb $Adb @('shell','ls','-1','/dev/block/by-name/')
+    param($Adb, [string]$Serial)
+    $raw = Invoke-Adb -Adb $Adb -Arguments @('shell','ls','-1','/dev/block/by-name/') -Serial $Serial
     $names = @()
     if ($raw -match 'Permission denied' -or $raw -match 'No such file') {
-        $raw = Invoke-Adb $Adb @('shell','ls','-1','/dev/block/bootdevice/by-name/')
+        $raw = Invoke-Adb -Adb $Adb -Arguments @('shell','ls','-1','/dev/block/bootdevice/by-name/') -Serial $Serial
     }
     foreach ($token in ($raw -split "`r?`n")) {
         $t = $token.Trim()
@@ -103,8 +106,8 @@ function Resolve-RamdiskPlan {
 }
 
 function Get-PackageInventory {
-    param($Adb, [string]$OutFile)
-    $pkgs = Invoke-Adb $Adb @('shell','cmd','package','list','packages','-f')
+    param($Adb, [string]$OutFile, [string]$Serial)
+    $pkgs = Invoke-Adb -Adb $Adb -Arguments @('shell','cmd','package','list','packages','-f') -Serial $Serial
     Set-Content -Path $OutFile -Value $pkgs -Encoding UTF8
     return (($pkgs -split "`r?`n") | Where-Object { $_ -match '^package:' }).Count
 }
@@ -127,11 +130,11 @@ function Invoke-Diagnostics {
     $adb = Get-Tool 'adb'
     if (-not $adb) {
         Write-Log 'ERROR: adb.exe not found. Place platform-tools in .\tools\ or add to PATH.' 'Red'
-        return
+        throw 'ADB was not found.'
     }
 
     Write-Log "Using adb: $adb"
-    $deviceList = Invoke-Adb $adb @('devices')
+    $deviceList = Invoke-Adb -Adb $adb -Arguments @('devices')
     Write-Log "adb devices ->`n$deviceList"
 
     $ready = @()
@@ -141,9 +144,18 @@ function Invoke-Diagnostics {
             Write-Log "Device $($Matches[1]) is UNAUTHORIZED - accept the RSA prompt on the phone." 'Yellow'
         }
     }
-    if (-not $ready) { Write-Log 'No authorized device connected.' 'Red'; return }
+    if (-not $ready) {
+        Write-Log 'No authorized device connected. Accept the USB debugging prompt and try again.' 'Red'
+        throw 'No authorized ADB device was found.'
+    }
 
-    if ($OnlySerial) { $ready = $ready | Where-Object { $_ -eq $OnlySerial } }
+    if ($OnlySerial) {
+        $ready = @($ready | Where-Object { $_ -eq $OnlySerial })
+        if (-not $ready) {
+            Write-Log "No authorized device found with serial $OnlySerial." 'Red'
+            throw "No authorized ADB device found with serial $OnlySerial."
+        }
+    }
 
     New-Item -ItemType Directory -Force -Path $ReportDir | Out-Null
 
@@ -151,7 +163,7 @@ function Invoke-Diagnostics {
     foreach ($serial in $ready) {
         Write-Log "===== Device $serial =====" 'Cyan'
 
-        $props = Get-DeviceProps $adb
+        $props = Get-DeviceProps $adb $serial
         foreach ($k in $props.Keys) { Write-Log ("  {0} = {1}" -f $k, $props[$k]) }
 
         $buildMatch = ($props['ro.build.fingerprint'] -eq $Expected) -or
@@ -160,7 +172,7 @@ function Invoke-Diagnostics {
         else { Write-Log "  WARNING: build differs from expected $Expected" 'Yellow' }
 
         Write-Log '  --- Partition layout ---' 'Cyan'
-        $parts = Get-PartitionProbe $adb
+        $parts = Get-PartitionProbe $adb $serial
         if ($parts.Count -eq 0) { Write-Log '  Partition list unavailable (SELinux restriction).' 'Yellow' }
         foreach ($p in $parts) { Write-Log "  $p" }
 
@@ -182,18 +194,18 @@ function Invoke-Diagnostics {
 
         Write-Log '  --- Snapshot ---' 'Cyan'
         $logcat = Join-Path $ReportDir "logcat_$serial.txt"
-        Invoke-Adb $adb @('logcat','-d') | Set-Content -Path $logcat -Encoding UTF8
+        Invoke-Adb -Adb $adb -Arguments @('logcat','-d') -Serial $serial | Set-Content -Path $logcat -Encoding UTF8
         Write-Log "  logcat -> $logcat"
 
         $pkgFile = Join-Path $ReportDir "packages_$serial.txt"
-        $pkgCount = Get-PackageInventory $adb $pkgFile
+        $pkgCount = Get-PackageInventory $adb $pkgFile $serial
         Write-Log "  packages: $pkgCount entries -> $pkgFile"
 
         $settings = Join-Path $ReportDir "settings_$serial.txt"
         $snapshot = @(
-            (Invoke-Adb $adb @('shell','settings','list','global')),
-            (Invoke-Adb $adb @('shell','dumpsys','package','|','grep','-c','Package')),
-            (Invoke-Adb $adb @('shell','df','-h'))
+            (Invoke-Adb -Adb $adb -Arguments @('shell','settings','list','global') -Serial $serial),
+            (Invoke-Adb -Adb $adb -Arguments @('shell','dumpsys','package','|','grep','-c','Package') -Serial $serial),
+            (Invoke-Adb -Adb $adb -Arguments @('shell','df','-h') -Serial $serial)
         ) -join "`n`n"
         Set-Content -Path $settings -Value $snapshot -Encoding UTF8
 
